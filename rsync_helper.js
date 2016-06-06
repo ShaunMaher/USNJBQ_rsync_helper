@@ -9,7 +9,8 @@ var Q = require('q');
 const MaxUsableSnapshotAge = 3600;
 
 // This creates an insance of a "path" object that will format things in Posix
-//  format by default
+//  format by default (which we need for any path that will be provided to
+//  rsync)
 var PosixPath = require('path').posix;
 
 /*
@@ -140,13 +141,16 @@ function ProcessFile(InputFilename, OutputFilename) {
 }
 
 // Main script entry point
+//  This would be simplier if rewritten with generators/yield but I'll get to
+//  know promises better first.
 let Volumes = {};
 let VolumeSnapshots = {};
+
 EnumVolumes()
 .then(function(items) {
   Volumes = items;
 
-  //TODO: Execute any hook scripts
+  //TODO: Execute any pre-snapshot hook scripts
 
   //Create a list of VSSSnapshots that already exist
   console.log(VSSSnapshot);
@@ -228,6 +232,8 @@ EnumVolumes()
     //TODO: Add any snapshots in "items" to the "VolumeSnapshots" array.
   }
 
+  //TODO: Execute any post-snapshot hook scripts
+
   // Extract the OutputToFile values for each volume and start a ProcessFile()
   var ProcessFilePromises = [];
   for (let index in Volumes) {
@@ -235,8 +241,8 @@ EnumVolumes()
 
     // The output file is going to be the same path as the input file only
     //  without the .in at the end.
-    //TODO: make the OutputFilename customisable from registry (same key as read
-    //  by EnumVolumes)
+    //TODO: Make the OutputFilename customisable from the registry (same key as
+    //  read by EnumVolumes)
     var OutputFilename = Path.parse(InputFilename);
     OutputFilename.ext = "";
     OutputFilename.base = "";
@@ -252,8 +258,6 @@ EnumVolumes()
   return Q.allSettled(ProcessFilePromises);
 })
 .then(function() {
-  console.log("This should mean that file processing is complete.");
-
   //TODO: Configure rsync daemon
 
   //TODO: Restart rsync daemon
