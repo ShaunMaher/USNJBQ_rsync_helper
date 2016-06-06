@@ -1,9 +1,12 @@
 "use strict"
 var LineByLineReader = require('line-by-line');
+var vsssnapshot = require('vss-snapshot');
+var VSSSnapshot = new vsssnapshot();
 var FileSystem = require('fs');
 var Path = require('path');
 var Registry = require('winreg');
 var Q = require('q');
+const MaxUsableSnapshotAge = 3600;
 
 // This creates an insance of a "path" object that will format things in Posix
 //  format by default
@@ -65,8 +68,9 @@ function EnumVolumes() {
 }
 
 function ProcessFile(InputFilename, OutputFilename) {
-  // Are are going to wedge each file/directory into an object using the full path
-  //  as the index.  This is a dodgy, memory consuming way to dedup the list.
+  // Are are going to wedge each file/directory into an object using the full
+  //  path as the index.  This is a dodgy, memory consuming way to dedup the
+  //  list.
   //  TODO: replace me with something more efficient.
   var OutputLines = {};
 
@@ -136,19 +140,103 @@ function ProcessFile(InputFilename, OutputFilename) {
 }
 
 // Main script entry point
+let Volumes = {};
+let VolumeSnapshots = {};
 EnumVolumes()
 .then(function(items) {
+  Volumes = items;
+
   //TODO: Execute any hook scripts
 
-  //TODO: Create a VSS snapshot
+  //Create a list of VSSSnapshots that already exist
+  console.log(VSSSnapshot);
+  var VSSListPromises = [];
+  for (let index in Volumes) {
+    let Volume = index;
+    VSSListPromises.push(VSSSnapshot.List(Volume));
+  }
+  return Q.allSettled(VSSListPromises);
+})
+
+.then(function(items) {
+  // Process the results from the VSSSnapshot.List operation into a single array
+  for (let index in items) {
+    // Handle any errors
+    if (items[index].state == 'rejected') {
+      throw items[index].reason;
+    }
+
+    for (let snapshot of items[index].value) {
+      if (!VolumeSnapshots[snapshot.Volume]) {
+        VolumeSnapshots[snapshot.Volume] = [];
+      }
+      VolumeSnapshots[snapshot.Volume].push(snapshot);
+    }
+  }
+  console.log(VolumeSnapshots);
+
+  // If a snapshot was created recently, use it.  Otherwise, create a new
+  //  snapshot now
+  let VolumeSuitableSnapshots = [];
+  let VolumeCreatePromises = [];
+  for (let index in Volumes) {
+    for (let snapshot of VolumeSnapshots[index]) {
+      //TODO: Add support for getting a custom MaxUsableSnapshotAge from the
+      //  registry (same key as read by EnumVolumes)
+      if (snapshot.Age() < MaxUsableSnapshotAge) {
+        if (VolumeSuitableSnapshots[index]) {
+          if (VolumeSuitableSnapshots[index].Age() < snapshot.Age()) {
+            VolumeSuitableSnapshots[index] = snapshot;
+          }
+        }
+        else {
+          VolumeSuitableSnapshots[index] = snapshot;
+        }
+      }
+    }
+    if (!VolumeSuitableSnapshots[index]) {
+      console.log("No suitable existing snapshot of " + index + " exists.  A new snapshot will be created.");
+      VolumeCreatePromises.push(VSSSnapshot.Create(index));
+    }
+    else {
+      console.log("Using existing snapshot of " + index + " created " + VolumeSuitableSnapshots[index].Age() + "s ago");
+    }
+  }
+
+  if (VolumeCreatePromises.length > 0) {
+    return Q.allSettled(VolumeCreatePromises);
+  }
+  else {
+    // This is just a convienient way to pass onto the next .then().  Probably a
+    //  prettier way.
+    let deferred = Q.defer();
+    setTimeout(function() {
+      deferred.resolve();
+    }, 1);
+    return Q.allSettled(deferred);
+  }
+})
+
+.then(function(items) {
+  console.log(items);
+  for (let index in items) {
+    // Handle any errors
+    if (items[index].state == 'rejected') {
+      throw items[index].reason;
+    }
+
+    //TODO: Add any snapshots in "items" to the "VolumeSnapshots" array.
+  }
 
   // Extract the OutputToFile values for each volume and start a ProcessFile()
   var ProcessFilePromises = [];
-  for (var index in items) {
-    var InputFilename = items[index]['OutputToFile'];
+  for (let index in Volumes) {
+    var InputFilename = Volumes[index]['OutputToFile'];
 
     // The output file is going to be the same path as the input file only
     //  without the .in at the end.
+    //TODO: make the OutputFilename customisable from registry (same key as read
+    //  by EnumVolumes)
     var OutputFilename = Path.parse(InputFilename);
     OutputFilename.ext = "";
     OutputFilename.base = "";
@@ -171,6 +259,6 @@ EnumVolumes()
   //TODO: Restart rsync daemon
 })
 .fail(function(err) {
-  console.log("Error:", err);
+  console.log("Promise Error: ", err.message);
 })
 .done();
