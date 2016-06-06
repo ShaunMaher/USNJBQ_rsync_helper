@@ -1,0 +1,24 @@
+{
+  "name": "USNJBQ_rsync_helper",
+  "version": "1.0.0",
+  "description": "Wiki Engine",
+  "main": "rsync_helper.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShaunMaher/USNJBQ_rsync_helper"
+  },
+  "author": "Shaun Maher <shaun@ghanima.net>",
+  "license": "BSD-2-Clause",
+  "bugs": {
+    "url": "https://github.com/ShaunMaher/USNJBQ_rsync_helper/issues"
+  },
+  "homepage": "https://github.com/ShaunMaher/USNJBQ_rsync_helper#readme",
+  "dependencies": {
+    "line-by-line": "^0.1.4",
+    "winreg": "^1.2.1",
+    "q": "^1.4.1"
+  }
+}
