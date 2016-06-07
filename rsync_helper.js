@@ -7,12 +7,35 @@ var FileSystem = require('fs');
 var Path = require('path');
 var Registry = require('winreg');
 var Q = require('q');
-const MaxUsableSnapshotAge = 3600;
+
+// Registry locations
+const SettingsKey = '\\Software\\USNJBackupQueue';
+const VolumesKey = SettingsKey + '\\Volumes';
 
 // This creates an insance of a "path" object that will format things in Posix
 //  format by default (which we need for any path that will be provided to
 //  rsync)
 var PosixPath = require('path').posix;
+
+function GetSettings() {
+  var deferred = Q.defer();
+  var ReturnValues = {};
+
+  var Key = new Registry({
+    hive: Registry.HKLM,
+    key: SettingsKey
+  });
+
+  Key.values(function(err, values) {
+    for (var value of values) {
+      AppSettings[value.name] = value.value;
+    }
+
+    deferred.resolve(true);
+  })
+
+  return deferred.promise;
+}
 
 /*
   Fetch a list of volumes that we should process based on the entries in the
@@ -23,12 +46,12 @@ function EnumVolumes() {
   var ReturnKeys = {};
 
   // Enumerate Volumes and input files that will need to be processed
-  var VolumesKey = new Registry({
+  var Key = new Registry({
     hive: Registry.HKLM,
-    key: '\\Software\\USNJBackupQueue\\Volumes'
+    key: VolumesKey
   });
 
-  VolumesKey.keys(function(err, items) {
+  Key.keys(function(err, items) {
     if (err) {
       deferred.reject(err);
     }
@@ -148,9 +171,23 @@ let Volumes = {};
 let VolumeSnapshots = {};
 let VolumeSuitableSnapshots = {};
 
-EnumVolumes()
+let AppSettings = {
+  // Cygwin default settings
+  'RsyncConfPath': 'C:\\cygwin\\etc\\rsyncd.conf',
+  'RsyncLockPath': '/var/run/rsyncd.lock',
+  'RsyncLogPath': '/var/log/rsyncd.log',
+  'RsyncdServiceName': 'rsyncd',
+
+  // Other default setting values
+  'MaxUsableSnapshotAge': 3600
+};
+
+Q.allSettled([EnumVolumes(), GetSettings()])
 .then(function(items) {
-  Volumes = items;
+  Volumes = items[0].value;
+  //AppSettings = items[1].value;
+
+  console.log(AppSettings);
 
   //TODO: Execute any pre-snapshot hook scripts
 
@@ -186,9 +223,9 @@ EnumVolumes()
   let VolumeCreatePromises = [];
   for (let index in Volumes) {
     for (let snapshot of VolumeSnapshots[index]) {
-      //TODO: Add support for getting a custom MaxUsableSnapshotAge from the
-      //  registry (same key as read by EnumVolumes)
-      if (snapshot.Age() < MaxUsableSnapshotAge) {
+      // Only accept snapshots that are less than "MaxUsableSnapshotAge" seconds
+      //  old.
+      if (snapshot.Age() < AppSettings['MaxUsableSnapshotAge']) {
         if (VolumeSuitableSnapshots[index]) {
           if (VolumeSuitableSnapshots[index].Age() > snapshot.Age()) {
             VolumeSuitableSnapshots[index] = snapshot;
@@ -259,11 +296,11 @@ EnumVolumes()
   return Q.allSettled(ProcessFilePromises);
 })
 .then(function() {
-  //TODO: Configure rsync daemon
+  // Configure rsync daemon
   RsyncConf.MaxConnections = 2;
   RsyncConf.UseChroot = false;
-  RsyncConf.LogFile = '/cygdrive/c/ProgramData/TimeMachineVault/rsyncd.log';
-  RsyncConf.LockFile = '/cygdrive/c/ProgramData/TimeMachineVault/rsyncd.lock';
+  RsyncConf.LogFile = AppSettings['RsyncLogPath'];
+  RsyncConf.LockFile = AppSettings['RsyncLockPath'];
 
   for (let index in Volumes) {
     let VolumeDriveLetter = index.replace(/:/, '');
@@ -287,7 +324,7 @@ EnumVolumes()
 
   // Save the config and restart the service (the final argument is the
   //  customised service name)
-  return RsyncConf.Save("C:\\ProgramData\\TimeMachineVault\\rsyncd.conf", "TimeMachineVault");
+  return RsyncConf.Save(AppSettings['RsyncConfPath'], AppSettings['RsyncdServiceName']);
 })
 .then(function() {
   console.log("Saved?");
