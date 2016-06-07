@@ -2,6 +2,7 @@
 var LineByLineReader = require('line-by-line');
 var vsssnapshot = require('vss-snapshot');
 var VSSSnapshot = new vsssnapshot();
+var RsyncConf = require('rsync-conf');
 var FileSystem = require('fs');
 var Path = require('path');
 var Registry = require('winreg');
@@ -145,6 +146,7 @@ function ProcessFile(InputFilename, OutputFilename) {
 //  know promises better first.
 let Volumes = {};
 let VolumeSnapshots = {};
+let VolumeSuitableSnapshots = {};
 
 EnumVolumes()
 .then(function(items) {
@@ -181,7 +183,6 @@ EnumVolumes()
 
   // If a snapshot was created recently, use it.  Otherwise, create a new
   //  snapshot now
-  let VolumeSuitableSnapshots = [];
   let VolumeCreatePromises = [];
   for (let index in Volumes) {
     for (let snapshot of VolumeSnapshots[index]) {
@@ -189,7 +190,7 @@ EnumVolumes()
       //  registry (same key as read by EnumVolumes)
       if (snapshot.Age() < MaxUsableSnapshotAge) {
         if (VolumeSuitableSnapshots[index]) {
-          if (VolumeSuitableSnapshots[index].Age() < snapshot.Age()) {
+          if (VolumeSuitableSnapshots[index].Age() > snapshot.Age()) {
             VolumeSuitableSnapshots[index] = snapshot;
           }
         }
@@ -259,8 +260,37 @@ EnumVolumes()
 })
 .then(function() {
   //TODO: Configure rsync daemon
+  RsyncConf.MaxConnections = 2;
+  RsyncConf.UseChroot = false;
+  RsyncConf.LogFile = '/cygdrive/c/ProgramData/TimeMachineVault/rsyncd.log';
+  RsyncConf.LockFile = '/cygdrive/c/ProgramData/TimeMachineVault/rsyncd.lock';
 
-  //TODO: Restart rsync daemon
+  for (let index in Volumes) {
+    let VolumeDriveLetter = index.replace(/:/, '');
+
+    // Reformat the snapshot's path to posix slashes and cygwin prefixed
+    let ModulePath = Path.parse(VolumeSuitableSnapshots[index].Path);
+    ModulePath = PosixPath.format(ModulePath);
+    ModulePath = ModulePath.replace(/\\\\\?\\GLOBALROOT\\/, '/proc/sys/');
+
+    // This looks stupid but it's necessary for rsync to use the snapshot
+    //  properly
+    ModulePath += '/\\./'
+
+    let NewModule = new RsyncConf.Module("VSS" + VolumeDriveLetter, ModulePath);
+    NewModule.ReadOnly = true;
+    NewModule.List = false;
+    NewModule.IncludeFrom = 'testing';
+    RsyncConf.AddModule(NewModule);
+  }
+  console.log(RsyncConf.toString());
+
+  // Save the config and restart the service (the final argument is the
+  //  customised service name)
+  return RsyncConf.Save("C:\\ProgramData\\TimeMachineVault\\rsyncd.conf", "TimeMachineVault");
+})
+.then(function() {
+  console.log("Saved?");
 })
 .fail(function(err) {
   console.log("Promise Error: ", err.message);
