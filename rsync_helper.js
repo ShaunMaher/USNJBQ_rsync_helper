@@ -1,7 +1,8 @@
 "use strict"
 var LineByLineReader = require('line-by-line');
-var vsssnapshot = require('vss-snapshot');
-var VSSSnapshot = new vsssnapshot();
+//var vsssnapshot = require('vss-snapshot');
+//var VSSSnapshots = new vsssnapshot();
+var VSSSnapshots = require('vss-snapshot');
 var RsyncConf = require('rsync-conf');
 var FileSystem = require('fs');
 var Path = require('path');
@@ -192,17 +193,17 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   //TODO: Execute any pre-snapshot hook scripts
 
   //Create a list of VSSSnapshots that already exist
-  console.log(VSSSnapshot);
+  console.log(VSSSnapshots);
   var VSSListPromises = [];
   for (let index in Volumes) {
     let Volume = index;
-    VSSListPromises.push(VSSSnapshot.List(Volume));
+    VSSListPromises.push(VSSSnapshots.List(Volume));
   }
   return Q.allSettled(VSSListPromises);
 })
 
 .then(function(items) {
-  // Process the results from the VSSSnapshot.List operation into a single array
+  // Process the results from the VSSSnapshots.List operation into a single array
   for (let index in items) {
     // Handle any errors
     if (items[index].state == 'rejected') {
@@ -238,7 +239,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
     }
     if (!VolumeSuitableSnapshots[index]) {
       console.log("No suitable existing snapshot of " + index + " exists.  A new snapshot will be created.");
-      VolumeCreatePromises.push(VSSSnapshot.Create(index));
+      VolumeCreatePromises.push(VSSSnapshots.Create(index));
     }
     else {
       console.log("Using existing snapshot of " + index + " created " + VolumeSuitableSnapshots[index].Age() + "s ago");
@@ -260,14 +261,22 @@ Q.allSettled([EnumVolumes(), GetSettings()])
 })
 
 .then(function(items) {
-  console.log(items);
   for (let index in items) {
     // Handle any errors
     if (items[index].state == 'rejected') {
       throw items[index].reason;
     }
 
-    //TODO: Add any snapshots in "items" to the "VolumeSnapshots" array.
+    // Add any snapshots in "items" to the "VolumeSnapshots" array and select
+    //  the new snapshot as the most suitable for rsyncing from.
+    try {
+      if (items[index].value instanceof VSSSnapshots.VSSSnapshot) {
+        console.log("A new snapshot was created.");
+        VolumeSnapshots[items[index].value.Volume].push(items[index].value);
+        VolumeSuitableSnapshots[items[index].value.Volume] = items[index].value;
+      }
+    }
+    catch (err) { console.log(err) }
   }
 
   //TODO: Execute any post-snapshot hook scripts
@@ -306,19 +315,29 @@ Q.allSettled([EnumVolumes(), GetSettings()])
     let VolumeDriveLetter = index.replace(/:/, '');
 
     // Reformat the snapshot's path to posix slashes and cygwin prefixed
-    let ModulePath = Path.parse(VolumeSuitableSnapshots[index].Path);
-    ModulePath = PosixPath.format(ModulePath);
-    ModulePath = ModulePath.replace(/\\\\\?\\GLOBALROOT\\/, '/proc/sys/');
+    if (VolumeSuitableSnapshots[index]) {
+      if (VolumeSuitableSnapshots[index] instanceof VSSSnapshots.VSSSnapshot) {
+        let ModulePath = Path.parse(VolumeSuitableSnapshots[index].Path);
+        ModulePath = PosixPath.format(ModulePath);
+        ModulePath = ModulePath.replace(/\\\\\?\\GLOBALROOT\\/, '/proc/sys/');
 
-    // This looks stupid but it's necessary for rsync to use the snapshot
-    //  properly
-    ModulePath += '/\\./'
+        // This looks stupid but it's necessary for rsync to use the snapshot
+        //  properly
+        ModulePath += '/\\./'
 
-    let NewModule = new RsyncConf.Module("VSS" + VolumeDriveLetter, ModulePath);
-    NewModule.ReadOnly = true;
-    NewModule.List = false;
-    NewModule.IncludeFrom = 'testing';
-    RsyncConf.AddModule(NewModule);
+        let NewModule = new RsyncConf.Module("VSS" + VolumeDriveLetter, ModulePath);
+        NewModule.ReadOnly = true;
+        NewModule.List = false;
+        NewModule.IncludeFrom = 'testing';
+        RsyncConf.AddModule(NewModule);
+      }
+      else {
+        console.log("WARNING: The snapshot selected for " + index + " isn't actaully a snapshot.  This should never happen!");
+      }
+    }
+    else {
+      console.log("WARNING: No suitable snapshot of " + index + " were found or created.  This should never happen!");
+    }
   }
   console.log(RsyncConf.toString());
 
@@ -327,7 +346,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   return RsyncConf.Save(AppSettings['RsyncConfPath'], AppSettings['RsyncdServiceName']);
 })
 .then(function() {
-  console.log("Saved?");
+  // We're all done?
 })
 .fail(function(err) {
   console.log("Promise Error: ", err.message);
