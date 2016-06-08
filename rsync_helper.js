@@ -1,8 +1,7 @@
 "use strict"
 var LineByLineReader = require('line-by-line');
-//var vsssnapshot = require('vss-snapshot');
-//var VSSSnapshots = new vsssnapshot();
 var VSSSnapshots = require('vss-snapshot');
+var HookScripts = require("hook-scripts");
 var RsyncConf = require('rsync-conf');
 var FileSystem = require('fs');
 var Path = require('path');
@@ -190,10 +189,18 @@ Q.allSettled([EnumVolumes(), GetSettings()])
 
   console.log(AppSettings);
 
-  //TODO: Execute any pre-snapshot hook scripts
+  // Override the HookScripts.SearchPaths setting if one was specified in the
+  //  registry.
+  if (AppSettings['HookScriptsDir']) {
+    HookScripts.SearchPaths = [ AppSettings['HookScriptsDir'] ];
+  }
 
+  //TODO: Execute any pre-snapshot hook scripts
+  return Q.allSettled([HookScripts.RunScripts("pre-snapshot")]);
+})
+
+.then(function(items) {
   //Create a list of VSSSnapshots that already exist
-  console.log(VSSSnapshots);
   var VSSListPromises = [];
   for (let index in Volumes) {
     let Volume = index;
@@ -280,7 +287,10 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   }
 
   //TODO: Execute any post-snapshot hook scripts
+  return Q.allSettled([HookScripts.RunScripts("post-snapshot")]);
+})
 
+.then(function(items) {
   // Extract the OutputToFile values for each volume and start a ProcessFile()
   var ProcessFilePromises = [];
   for (let index in Volumes) {
@@ -339,7 +349,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
       console.log("WARNING: No suitable snapshot of " + index + " were found or created.  This should never happen!");
     }
   }
-  console.log(RsyncConf.toString());
+  //console.log(RsyncConf.toString());
 
   // Save the config and restart the service (the final argument is the
   //  customised service name)
