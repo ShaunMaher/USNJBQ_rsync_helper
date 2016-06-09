@@ -182,12 +182,11 @@ let AppSettings = {
   'MaxUsableSnapshotAge': 3600
 };
 
+// The first async step is loading a list of volumes and an array of settings
+//  from the Windows registry.
 Q.allSettled([EnumVolumes(), GetSettings()])
 .then(function(items) {
   Volumes = items[0].value;
-  //AppSettings = items[1].value;
-
-  console.log(AppSettings);
 
   // Override the HookScripts.SearchPaths setting if one was specified in the
   //  registry.
