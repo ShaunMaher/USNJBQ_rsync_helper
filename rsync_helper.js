@@ -6,6 +6,7 @@ var RsyncConf = require('rsync-conf');
 var FileSystem = require('fs');
 var Path = require('path');
 var Registry = require('winreg');
+var CycleLogs = require("cycle-logs");
 var Q = require('q');
 
 // Registry locations
@@ -92,7 +93,7 @@ function EnumVolumes() {
   return deferred.promise;
 }
 
-function ProcessFile(InputFilename, OutputFilename) {
+function ProcessFile(InputFilename, IntermediateFilename, OutputFilename) {
   // Are are going to wedge each file/directory into an object using the full
   //  path as the index.  This is a dodgy, memory consuming way to dedup the
   //  list.
@@ -101,65 +102,156 @@ function ProcessFile(InputFilename, OutputFilename) {
 
   var deferred = Q.defer();
 
-  // Start reading the file
-  var LineReader = new LineByLineReader(InputFilename, {skipEmptyLines: true});
-
-  // IF something fails, fail the promise
-  LineReader.on('error', function(err) {
-    console.log(err);
-    deferred.fail(err);
-  });
-
-  LineReader.on('line', function(line) {
-    // Pause the generation of "line" events while we process this line
-    LineReader.pause();
-
-    // Process the line
-    var ThisFile = Path.parse(line);
-    var ThisFileName = PosixPath.format(ThisFile);
-
-    // If this line already exists in the OutputLines array, don't process it
-    //  again
-    if (OutputLines[ThisFileName]) {
-      //TODO: Add a setTimeout to limit CPU usage?
-      LineReader.resume();
-    }
-
-    else {
-      var NewLines = "+ /" + ThisFileName + '\r\n';
-      OutputLines[PosixPath.format(ThisFile)] = 1;
-
-      // rsync needs not just the files we want to backup in the resulting
-      //  include-from list but also the parent directories.  Recurse up to the
-      //  highest possible level and include all of those directories.
-      var ThisDir = Path.parse(ThisFile.dir);
-      var ThisDirName = PosixPath.format(ThisDir);
-      while (ThisDir.name.length > 0) {
-        if (!OutputLines[ThisFileName]) {
-          OutputLines[ThisDirName] = 1;
-          NewLines += "+ /" + ThisDirName + '\r\n';
-        }
-
-        ThisDir = Path.parse(ThisDir.dir);
-        ThisDirName = PosixPath.format(ThisDir);
+  FileSystem.stat(InputFilename, function(err, stats) {
+    if (err) {
+      // If the InputFilename wasn't created, it might be because there were no
+      //  new lines since the most recent backup.  This is not an error.
+      if (err.code == 'ENOENT') {
+        console.log("No new lines found?");
+        deferred.resolve(OutputLines);
       }
-
-      // Use the callback from the appendFile function as the trigger to ask the
-      //  LineReader for the next line
-      FileSystem.appendFile(OutputFilename, NewLines, function() {
-        //TODO: Add a setTimeout to limit CPU usage?
-        LineReader.resume();
-      })
+      else {
+        console.log(err);
+        deferred.fail(err);
+      }
+      return;
     }
-  });
 
-  LineReader.on('end', function() {
-    // The last thing we need to do before returning our promise is add the
-    //  "exclude everything else" entry to the end of the file.
-    FileSystem.appendFile(OutputFilename, "- *\r\n", function() {
-      deferred.resolve(OutputLines);
-    })
-  })
+    // First up we need to append the content of InputFilename to the
+    //  IntermediateFilename.  If a backup wasn't run between the last time we
+    //  processed the InputFilename and now, or the backup failed, both the list
+    //  of files we put into the IntermediateFilename last time and any new files
+    //  we extract from InputFilename on this run will be merged into a list of
+    //  all changed files since the last SUCCESSFUL backup.
+    var InputLineReader = new LineByLineReader(InputFilename, {skipEmptyLines: true});
+
+    // If something fails, fail the promise
+    InputLineReader.on('error', function(err) {
+      console.log(err);
+      deferred.fail(err);
+    });
+
+    InputLineReader.on('line', function(line) {
+      // Pause the generation of "line" events while we process this line
+      InputLineReader.pause();
+
+      FileSystem.appendFile(IntermediateFilename, line + '\r\n', function() {
+        //TODO: Add a setTimeout to limit CPU usage?
+        InputLineReader.resume();
+      })
+    });
+
+    InputLineReader.on('end', function() {
+      // Purge the OutputFilename as anything in it is the past.
+      FileSystem.truncate(OutputFilename, 0, function(err) {
+        // We're not going to check "err".  It's not really important to act on
+        //  the file not existing, etc. and we will handle write errors later.
+
+        // Purge the InputFilename because everything in it has been safely moved
+        //  to the IntermediateFilename
+        FileSystem.truncate(InputFilename, 0, function(err) {
+          if (err) {
+            console.log(err);
+            deferred.fail(err);
+            return;
+          }
+
+          FileSystem.stat(IntermediateFilename, function(err, stats) {
+            if (err) {
+              // If the IntermediateFilename wasn't created, it might be because
+              //  there were no new lines in the InputFilename.  This is not an
+              //  error.
+              if (err.code == 'ENOENT') {
+                console.log("No new lines found?");
+                deferred.resolve(OutputLines);
+              }
+              else {
+                console.log(err);
+                deferred.fail(err);
+              }
+              return;
+            }
+
+            // Now we take the content of IntermediateFilename, reformat it's lines
+            //  and output them to the OutputFilename.
+            var LineReader = new LineByLineReader(IntermediateFilename, {skipEmptyLines: true});
+
+            // If something fails, fail the promise
+            LineReader.on('error', function(err) {
+              console.log(err);
+              deferred.fail(err);
+            });
+
+            LineReader.on('line', function(line) {
+              // Pause the generation of "line" events while we process this line
+              LineReader.pause();
+
+              // Process the line
+              var ThisFile = Path.parse(line);
+              var ThisFileName = PosixPath.format(ThisFile);
+
+              // If this line already exists in the OutputLines array, don't process
+              //  it again
+              if (OutputLines[ThisFileName]) {
+                //TODO: Add a setTimeout to limit CPU usage?
+                LineReader.resume();
+              }
+
+              // If the line is only whitespace, it is junk.
+              else if (line.replace(/\s/).length == 0) {
+                console.log("Dropping a line of junk: '" + line + "'");
+                LineReader.resume();
+              }
+
+              // Somehow my test data ended up with a bunch of null characters
+              //  which made weird things happen.  This should never happen in
+              //  the real world but we'll filter out lines with nulls anyway as
+              //  a precaution.
+              else if (line.match(/\0/)) {
+                console.log("Dropping a line with null characters: '" + line.replace(/\0\0.*\0/g, "\\0\\0...\\0").replace(/\0/g, "\\0") + "'");
+                LineReader.resume();
+              }
+
+              else {
+                var NewLines = "+ /" + ThisFileName + '\r\n';
+                OutputLines[PosixPath.format(ThisFile)] = 1;
+
+                // rsync needs not just the files we want to backup in the resulting
+                //  include-from list but also the parent directories.  Recurse up to the
+                //  highest possible level and include all of those directories.
+                var ThisDir = Path.parse(ThisFile.dir);
+                var ThisDirName = PosixPath.format(ThisDir);
+                while (ThisDir.name.length > 0) {
+                  if (!OutputLines[ThisFileName]) {
+                    OutputLines[ThisDirName] = 1;
+                    NewLines += "+ /" + ThisDirName + '\r\n';
+                  }
+
+                  ThisDir = Path.parse(ThisDir.dir);
+                  ThisDirName = PosixPath.format(ThisDir);
+                }
+
+                // Use the callback from the appendFile function as the trigger to ask the
+                //  LineReader for the next line
+                FileSystem.appendFile(OutputFilename, NewLines, function() {
+                  //TODO: Add a setTimeout to limit CPU usage?
+                  LineReader.resume();
+                })
+              }
+            });
+
+            LineReader.on('end', function() {
+              // The last thing we need to do before returning our promise is add the
+              //  "exclude everything else" entry to the end of the file.
+              FileSystem.appendFile(OutputFilename, "- *\r\n", function() {
+                deferred.resolve(OutputLines);
+              });
+            });
+          });
+        });
+      });
+    });
+  });
 
   return deferred.promise;
 }
@@ -170,6 +262,28 @@ function ProcessFile(InputFilename, OutputFilename) {
 let Volumes = {};
 let VolumeSnapshots = {};
 let VolumeSuitableSnapshots = {};
+let BackupResult = "failed";
+let BackupCleanup = false;
+let BackupType = "incr";
+process.argv.forEach(function(val, index, array) {
+  if ((val.match(/post-backup/i)) || (val.match(/postbackup/i))) {
+    if (index <= array.length) {
+      BackupResult = array[index + 1];
+    }
+    console.log("Post backup cleanup for " + BackupResult + " backup!")
+    BackupCleanup = true;
+  }
+  else if ((val.match(/backup-type/i)) || (val.match(/backuptype/i) || (val.match(/type/i)))) {
+    if (index <= array.length) {
+      BackupType = array[index + 1];
+      console.log("Rsync will be configured for a " + BackupType + " backup.");
+    }
+  }
+  else if ((val.match(/full/i))) {
+    BackupType = "full";
+    console.log("Rsync will be configured for a " + BackupType + " backup.");
+  }
+});
 
 let AppSettings = {
   // Cygwin default settings
@@ -194,8 +308,13 @@ Q.allSettled([EnumVolumes(), GetSettings()])
     HookScripts.SearchPaths = [ AppSettings['HookScriptsDir'] ];
   }
 
-  //TODO: Execute any pre-snapshot hook scripts
-  return Q.allSettled([HookScripts.RunScripts("pre-snapshot")]);
+  if (BackupCleanup) {
+    return Q.allSettled([HookScripts.RunScripts("post-backup")]);
+  }
+  else {
+    // Execute any pre-snapshot hook scripts
+    return Q.allSettled([HookScripts.RunScripts("pre-snapshot")]);
+  }
 })
 
 .then(function(items) {
@@ -243,11 +362,11 @@ Q.allSettled([EnumVolumes(), GetSettings()])
         }
       }
     }
-    if (!VolumeSuitableSnapshots[index]) {
+    if ((!VolumeSuitableSnapshots[index]) && (!BackupCleanup)) {
       console.log("No suitable existing snapshot of " + index + " exists.  A new snapshot will be created.");
       VolumeCreatePromises.push(VSSSnapshots.Create(index));
     }
-    else {
+    else if (!BackupCleanup)  {
       console.log("Using existing snapshot of " + index + " created " + VolumeSuitableSnapshots[index].Age() + "s ago");
     }
   }
@@ -280,33 +399,63 @@ Q.allSettled([EnumVolumes(), GetSettings()])
         console.log("A new snapshot was created.");
         VolumeSnapshots[items[index].value.Volume].push(items[index].value);
         VolumeSuitableSnapshots[items[index].value.Volume] = items[index].value;
+
+        //TODO: Record the creation of a snapshot so it can be removed by a
+        //  cleanup operation later
       }
     }
     catch (err) { console.log(err) }
   }
 
-  //TODO: Execute any post-snapshot hook scripts
-  return Q.allSettled([HookScripts.RunScripts("post-snapshot")]);
+  if (BackupCleanup) {
+    // Execute hooks for this specific backup result (success/failed)
+    return Q.allSettled([HookScripts.RunScripts("post-backup-" + BackupResult)]);
+  }
+  else {
+    // Execute any post-snapshot hook scripts
+    return Q.allSettled([HookScripts.RunScripts("post-snapshot")]);
+  }
 })
 
 .then(function(items) {
-  // Extract the OutputToFile values for each volume and start a ProcessFile()
   var ProcessFilePromises = [];
+
+  // Extract the OutputToFile values for each volume and start a ProcessFile()
   for (let index in Volumes) {
     var InputFilename = Volumes[index]['OutputToFile'];
 
+    //TODO: Stop the relevant BackupQueueFromUSNJournal services
+
     // The output file is going to be the same path as the input file only
     //  without the .in at the end.
-    //TODO: Make the OutputFilename customisable from the registry (same key as
-    //  read by EnumVolumes)
+    //TODO: Make the OutputFilename and IntermediateFilename customisable from
+    //  the registry (same key as read by EnumVolumes)
     var OutputFilename = Path.parse(InputFilename);
     OutputFilename.ext = "";
     OutputFilename.base = "";
     OutputFilename = Path.format(OutputFilename);
 
+    var IntermediateFilename = Path.parse(InputFilename);
+    IntermediateFilename.ext = ".queue";
+    IntermediateFilename.base = "";
+    IntermediateFilename = Path.format(IntermediateFilename);
+
+    // We need to remember the OutputFilename for later when we're configuring
+    //  the rsync daemon
+    Volumes[index]['IncludeFromFile'] = OutputFilename;
+
     console.log(InputFilename);
     console.log(OutputFilename);
-    ProcessFilePromises.push(ProcessFile(InputFilename, OutputFilename));
+
+    if (BackupCleanup) {
+      //TODO: If the backup was successful, purge the IntermediateFilename
+      //FileSystem.truncate(IntermediateFilename, 0, function(err) {
+      //
+      //}
+    }
+    else {
+      ProcessFilePromises.push(ProcessFile(InputFilename, IntermediateFilename, OutputFilename));
+    }
   }
 
   // Only return from this "then" block once all of the ProcessFile promises are
@@ -314,45 +463,80 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   return Q.allSettled(ProcessFilePromises);
 })
 .then(function() {
-  // Configure rsync daemon
-  RsyncConf.MaxConnections = 2;
-  RsyncConf.UseChroot = false;
-  RsyncConf.LogFile = AppSettings['RsyncLogPath'];
-  RsyncConf.LockFile = AppSettings['RsyncLockPath'];
+  if (BackupCleanup) {
+    //TODO: Anything left for the cleanup process?
+  }
+  else {
+    var CyclePromises = [];
 
-  for (let index in Volumes) {
-    let VolumeDriveLetter = index.replace(/:/, '');
+    for (let index in Volumes) {
+      console.log(Volumes[index]);
 
-    // Reformat the snapshot's path to posix slashes and cygwin prefixed
-    if (VolumeSuitableSnapshots[index]) {
-      if (VolumeSuitableSnapshots[index] instanceof VSSSnapshots.VSSSnapshot) {
-        let ModulePath = Path.parse(VolumeSuitableSnapshots[index].Path);
-        ModulePath = PosixPath.format(ModulePath);
-        ModulePath = ModulePath.replace(/\\\\\?\\GLOBALROOT\\/, '/proc/sys/');
+      //TODO: Cycle the BackupQueueFromUSNJournal logs
+      if (Volumes[index]['LogToFile']) {
+        let LogFile = CycleLogs(Volumes[index]['LogToFile'] + '.verbose.log');
+        CyclePromises.push(LogFile.cycle());
 
-        // This looks stupid but it's necessary for rsync to use the snapshot
-        //  properly
-        ModulePath += '/\\./'
+        LogFile = CycleLogs(Volumes[index]['LogToFile'] + '.errors.log');
+        CyclePromises.push(LogFile.cycle());
 
-        let NewModule = new RsyncConf.Module("VSS" + VolumeDriveLetter, ModulePath);
-        NewModule.ReadOnly = true;
-        NewModule.List = false;
-        NewModule.IncludeFrom = 'testing';
-        RsyncConf.AddModule(NewModule);
+        LogFile = CycleLogs(Volumes[index]['LogToFile'] + '.log');
+        CyclePromises.push(LogFile.cycle());
+      }
+
+      //TODO: Start the BackupQueueFromUSNJournal services
+    }
+    return Q.allSettled(CyclePromises);
+  }
+})
+.then(function() {
+  console.log("Done Cycling");
+  if (BackupCleanup) {
+    //TODO: Anything left for the cleanup process?
+  }
+  else {
+    // Configure rsync daemon
+    RsyncConf.MaxConnections = 2;
+    RsyncConf.UseChroot = false;
+    RsyncConf.LogFile = AppSettings['RsyncLogPath'];
+    RsyncConf.LockFile = AppSettings['RsyncLockPath'];
+
+    for (let index in Volumes) {
+      let VolumeDriveLetter = index.replace(/:/, '');
+
+      // Reformat the snapshot's path to posix slashes and cygwin prefixed
+      if (VolumeSuitableSnapshots[index]) {
+        if (VolumeSuitableSnapshots[index] instanceof VSSSnapshots.VSSSnapshot) {
+          let ModulePath = Path.parse(VolumeSuitableSnapshots[index].Path);
+          ModulePath = PosixPath.format(ModulePath);
+          ModulePath = ModulePath.replace(/\\\\\?\\GLOBALROOT\\/, '/proc/sys/');
+
+          // This looks stupid but it's necessary for rsync to use the snapshot
+          //  properly
+          ModulePath += '/\\./'
+
+          let NewModule = new RsyncConf.Module("VSS" + VolumeDriveLetter, ModulePath);
+          NewModule.ReadOnly = true;
+          NewModule.List = false;
+          if (BackupType != "full") {
+            NewModule.IncludeFrom = Volumes[index]['IncludeFromFile'];
+          }
+          RsyncConf.AddModule(NewModule);
+        }
+        else {
+          console.log("WARNING: The snapshot selected for " + index + " isn't actaully a snapshot.  This should never happen!");
+        }
       }
       else {
-        console.log("WARNING: The snapshot selected for " + index + " isn't actaully a snapshot.  This should never happen!");
+        console.log("WARNING: No suitable snapshots of " + index + " were found or created.  This should never happen!");
       }
     }
-    else {
-      console.log("WARNING: No suitable snapshot of " + index + " were found or created.  This should never happen!");
-    }
-  }
-  //console.log(RsyncConf.toString());
+    //console.log(RsyncConf.toString());
 
-  // Save the config and restart the service (the final argument is the
-  //  customised service name)
-  return RsyncConf.Save(AppSettings['RsyncConfPath'], AppSettings['RsyncdServiceName']);
+    // Save the config and restart the service (the final argument is the
+    //  customised service name)
+    return RsyncConf.Save(AppSettings['RsyncConfPath'], AppSettings['RsyncdServiceName']);
+  }
 })
 .then(function() {
   // We're all done?
