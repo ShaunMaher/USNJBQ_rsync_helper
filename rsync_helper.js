@@ -18,6 +18,71 @@ const VolumesKey = SettingsKey + '\\Volumes';
 //  rsync)
 var PosixPath = require('path').posix;
 
+function SaveNewSnapshot(Volume, Snapshot) {
+  var deferred = Q.defer();
+  var RunningPromises = [];
+  var SnapshotID = '';
+
+  if (Snapshot instanceof VSSSnapshots.VSSSnapshot) {
+    SnapshotID = Snapshot.ID;
+  }
+  else {
+    SnapshotID = Snapshot;
+  }
+
+  var Key = new Registry({
+    hive: Registry.HKLM,
+    key: VolumesKey + '\\' + Volume
+  });
+
+  Key.get("SnapshotsCreated", function(err, value) {
+    let CurrentValue = '';
+
+    // I'm going to support both REG_SZ and REG_MULTI_SZ types here, defaulting
+    //  to REG_SZ.  The winreg module doesn't seem to support REG_MULTI_SZ right
+    //  now but might in the future.
+    let KeyType = Registry.REG_SZ;
+
+    // Get the current value
+    if (value) {
+      CurrentValue = value.value;
+      KeyType = value.type;
+    }
+
+    // Append the new value based on the current value type
+    let NewValue = '';
+    if (KeyType == Registry.REG_SZ) {
+      NewValue = CurrentValue + ',' + SnapshotID + ',';
+      NewValue = NewValue.replace(/^,/g, '');
+      NewValue = NewValue.replace(/,$/g, '');
+      NewValue = NewValue.replace(/,,/g, ',');
+    }
+    else if (KeyType == Registry.REG_MULTI_SZ) {
+      NewValue = CurrentValue + ',\n' + SnapshotID + '\n';
+      NewValue.replace(/\n\n/, "\n");
+    }
+    else {
+      // No other types are supported.  Value must be broken in some way.
+      NewValue = SnapshotID;
+      KeyType = Registry.REG_SZ;
+    }
+
+    Key.set("SnapshotsCreated", KeyType, NewValue, function(err) {
+      if (err) {
+        console.log(err);
+        deferred.fail(err);
+        return false;
+      }
+      else {
+        return deferred.resolve(true);
+        return true;
+      }
+    });
+  });
+
+  return deferred.promise;
+}
+
 function GetSettings() {
   var deferred = Q.defer();
   var ReturnValues = {};
@@ -328,6 +393,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
 })
 
 .then(function(items) {
+  let VolumeActionPromises = [];
   // Process the results from the VSSSnapshots.List operation into a single array
   for (let index in items) {
     // Handle any errors
@@ -344,48 +410,58 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   }
   console.log(VolumeSnapshots);
 
-  // If a snapshot was created recently, use it.  Otherwise, create a new
-  //  snapshot now
-  let VolumeCreatePromises = [];
-  for (let index in Volumes) {
-    for (let snapshot of VolumeSnapshots[index]) {
-      // Only accept snapshots that are less than "MaxUsableSnapshotAge" seconds
-      //  old.
-      if (snapshot.Age() < AppSettings['MaxUsableSnapshotAge']) {
-        if (VolumeSuitableSnapshots[index]) {
-          if (VolumeSuitableSnapshots[index].Age() > snapshot.Age()) {
-            VolumeSuitableSnapshots[index] = snapshot;
+
+  if (BackupCleanup) {
+    //TODO: Cleanup previously created snapshots
+    for (let volumeIndex in Volumes) {
+      let volume = Volumes[volumeIndex];
+      for (let index in VolumeSnapshots[volumeIndex]) {
+        let snapshot = VolumeSnapshots[volumeIndex][index];
+        //console.log(snapshot);
+        //console.log(volume["SnapshotsCreated"]);
+        if (volume["SnapshotsCreated"]) {
+          if (volume["SnapshotsCreated"].match(snapshot.ID)) {
+            console.log("Snapshot should be deleted.", snapshot);
+            VolumeActionPromises.push(snapshot.Delete());
           }
-        }
-        else {
-          VolumeSuitableSnapshots[index] = snapshot;
+
+          //TODO: Purge the SnapshotsCreated registry value
         }
       }
     }
-    if ((!VolumeSuitableSnapshots[index]) && (!BackupCleanup)) {
-      console.log("No suitable existing snapshot of " + index + " exists.  A new snapshot will be created.");
-      VolumeCreatePromises.push(VSSSnapshots.Create(index));
-    }
-    else if (!BackupCleanup)  {
-      console.log("Using existing snapshot of " + index + " created " + VolumeSuitableSnapshots[index].Age() + "s ago");
-    }
-  }
-
-  if (VolumeCreatePromises.length > 0) {
-    return Q.allSettled(VolumeCreatePromises);
   }
   else {
-    // This is just a convienient way to pass onto the next .then().  Probably a
-    //  prettier way.
-    let deferred = Q.defer();
-    setTimeout(function() {
-      deferred.resolve();
-    }, 1);
-    return Q.allSettled(deferred);
+    // If a snapshot was created recently, use it.  Otherwise, create a new
+    //  snapshot now
+    for (let index in Volumes) {
+      for (let snapshot of VolumeSnapshots[index]) {
+        // Only accept snapshots that are less than "MaxUsableSnapshotAge" seconds
+        //  old.
+        if (snapshot.Age() < AppSettings['MaxUsableSnapshotAge']) {
+          if (VolumeSuitableSnapshots[index]) {
+            if (VolumeSuitableSnapshots[index].Age() > snapshot.Age()) {
+              VolumeSuitableSnapshots[index] = snapshot;
+            }
+          }
+          else {
+            VolumeSuitableSnapshots[index] = snapshot;
+          }
+        }
+      }
+      if ((!VolumeSuitableSnapshots[index]) && (!BackupCleanup)) {
+        console.log("No suitable existing snapshot of " + index + " exists.  A new snapshot will be created.");
+        VolumeActionPromises.push(VSSSnapshots.Create(index));
+      }
+      else if (!BackupCleanup)  {
+        console.log("Using existing snapshot of " + index + " created " + VolumeSuitableSnapshots[index].Age() + "s ago");
+      }
+    }
   }
+  return Q.allSettled(VolumeActionPromises);
 })
 
 .then(function(items) {
+  let SaveNewSnapshotPromise = '';
   for (let index in items) {
     // Handle any errors
     if (items[index].state == 'rejected') {
@@ -402,6 +478,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
 
         //TODO: Record the creation of a snapshot so it can be removed by a
         //  cleanup operation later
+        SaveNewSnapshotPromise = SaveNewSnapshot(items[index].value.Volume, items[index].value);
       }
     }
     catch (err) { console.log(err) }
@@ -413,7 +490,7 @@ Q.allSettled([EnumVolumes(), GetSettings()])
   }
   else {
     // Execute any post-snapshot hook scripts
-    return Q.allSettled([HookScripts.RunScripts("post-snapshot")]);
+    return Q.allSettled([SaveNewSnapshotPromise, HookScripts.RunScripts("post-snapshot")]);
   }
 })
 
